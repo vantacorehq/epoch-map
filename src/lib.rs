@@ -5,24 +5,28 @@
 
 use core::cell::UnsafeCell;
 use core::hash::{Hash, Hasher};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::marker::PhantomData;
 
 const EMPTY: u64 = 0;
 const TOMBSTONE: u64 = 1;
 const OCCUPIED: u64 = 2;
 
+const MAX_THREADS: usize = 64;
+
 #[repr(C)]
 struct Slot<K, V> {
     state: AtomicU64,
     key: UnsafeCell<K>,
     value: UnsafeCell<V>,
+    retired_epoch: AtomicU64,
 }
 
 pub struct EpochMap<K, V, const N: usize> {
     slots: UnsafeCell<[Slot<K, V>; N]>,
     epoch_global: AtomicU64,
-    epoch_locals: [AtomicU64; 64],
+    epoch_locals: [AtomicU64; MAX_THREADS],
+    retired_count: AtomicUsize,
     _marker: PhantomData<(K, V)>,
 }
 
@@ -36,9 +40,11 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
                 state: AtomicU64::new(EMPTY),
                 key: UnsafeCell::new(K::default()),
                 value: UnsafeCell::new(V::default()),
+                retired_epoch: AtomicU64::new(0),
             })),
             epoch_global: AtomicU64::new(1),
             epoch_locals: core::array::from_fn(|_| AtomicU64::new(0)),
+            retired_count: AtomicUsize::new(0),
             _marker: PhantomData,
         }
     }
@@ -59,20 +65,52 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
         self.epoch_locals[tid].store(0, Ordering::Release);
     }
 
-    pub fn try_advance_epoch(&self) {
-        let current = self.epoch_global.load(Ordering::Acquire);
+    fn min_active_epoch(&self) -> u64 {
+        let mut min = u64::MAX;
         for local in &self.epoch_locals {
-            let l = local.load(Ordering::Acquire);
-            if l != 0 && l < current {
-                return;
+            let e = local.load(Ordering::Acquire);
+            if e != 0 && e < min {
+                min = e;
             }
         }
-        let _ = self.epoch_global.compare_exchange(
-            current,
-            current + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if min == u64::MAX {
+            self.epoch_global.load(Ordering::Acquire)
+        } else {
+            min
+        }
+    }
+
+    pub fn try_advance_and_reclaim(&self) {
+        let current = self.epoch_global.load(Ordering::Acquire);
+        let min_active = self.min_active_epoch();
+
+        if min_active >= current {
+            let _ = self.epoch_global.compare_exchange(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+
+        // Reclaim tombstones older than the minimum active epoch
+        let safe_epoch = self.min_active_epoch();
+        for i in 0..N {
+            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(i) };
+            let state = slot.state.load(Ordering::Acquire);
+            if state == TOMBSTONE {
+                let retired = slot.retired_epoch.load(Ordering::Acquire);
+                if retired != 0 && retired < safe_epoch {
+                    if slot
+                        .state
+                        .compare_exchange(TOMBSTONE, EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.retired_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
     }
 
     pub fn insert(&self, key: K, value: V) -> Option<V> {
@@ -101,9 +139,7 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
                     let existing = unsafe { *slot.key.get() };
                     if existing == key {
                         let old = unsafe { *slot.value.get() };
-                        unsafe {
-                            *slot.value.get() = value;
-                        }
+                        unsafe { *slot.value.get() = value };
                         return Some(old);
                     }
                     break;
@@ -150,14 +186,12 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
                     if existing == *key {
                         if slot
                             .state
-                            .compare_exchange(
-                                OCCUPIED,
-                                TOMBSTONE,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
+                            .compare_exchange(OCCUPIED, TOMBSTONE, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                         {
+                            let epoch = self.epoch_global.load(Ordering::Acquire);
+                            slot.retired_epoch.store(epoch, Ordering::Release);
+                            self.retired_count.fetch_add(1, Ordering::Relaxed);
                             return Some(unsafe { *slot.value.get() });
                         }
                         continue;
@@ -168,10 +202,6 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
             }
         }
         None
-    }
-
-    pub fn contains(&self, key: &K) -> bool {
-        self.get(key).is_some()
     }
 
     pub fn len_approx(&self) -> usize {
@@ -185,21 +215,11 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
         count
     }
 
-    pub fn clear(&self) {
-        for i in 0..N {
-            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(i) };
-            let _ = slot.state.compare_exchange(
-                OCCUPIED,
-                TOMBSTONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
+    pub fn retired_approx(&self) -> usize {
+        self.retired_count.load(Ordering::Relaxed)
     }
 }
-   
-   
-      
+           
                 
                
            
