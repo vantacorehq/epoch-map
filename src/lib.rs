@@ -1,3 +1,6 @@
+//! Lock-free concurrent hash map with epoch-based reclamation.
+//! Fixed capacity. Open addressing. Zero dependencies. no_std.
+
 #![no_std]
 
 use core::cell::UnsafeCell;
@@ -19,7 +22,7 @@ struct Slot<K, V> {
 pub struct EpochMap<K, V, const N: usize> {
     slots: UnsafeCell<[Slot<K, V>; N]>,
     epoch_global: AtomicU64,
-    epoch_locals: [AtomicU64; 32],
+    epoch_locals: [AtomicU64; 64],
     _marker: PhantomData<(K, V)>,
 }
 
@@ -47,111 +50,42 @@ impl<K: Copy + Eq + Hash + Default, V: Copy + Default, const N: usize> EpochMap<
         (h.finish() as usize) & (N - 1)
     }
 
+    /// Enter the current epoch. Call before any operation if you want reclamation safety.
     pub fn enter(&self, tid: usize) {
         let g = self.epoch_global.load(Ordering::Acquire);
         self.epoch_locals[tid].store(g, Ordering::Release);
     }
 
+    /// Exit the epoch.
     pub fn exit(&self, tid: usize) {
         self.epoch_locals[tid].store(0, Ordering::Release);
     }
 
-    pub fn insert(&self, key: K, value: V) -> Option<V> {
-        let start = self.hash(&key);
-        for probe in 0..N {
-            let idx = (start + probe) & (N - 1);
-            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(idx) };
-
-            loop {
-                let state = slot.state.load(Ordering::Acquire);
-                if state == EMPTY || state == TOMBSTONE {
-                    if slot
-                        .state
-                        .compare_exchange(state, OCCUPIED, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        unsafe {
-                            *slot.key.get() = key;
-                            *slot.value.get() = value;
-                        }
-                        return None;
-                    }
-                    continue;
-                }
-                if state == OCCUPIED {
-                    let existing = unsafe { *slot.key.get() };
-                    if existing == key {
-                        let old = unsafe { *slot.value.get() };
-                        unsafe { *slot.value.get() = value };
-                        return Some(old);
-                    }
-                    break;
-                }
+    /// Try to advance the global epoch if all threads have exited older epochs.
+    pub fn try_advance_epoch(&self) {
+        let current = self.epoch_global.load(Ordering::Acquire);
+        let mut can_advance = true;
+        for local in &self.epoch_locals {
+            let l = local.load(Ordering::Acquire);
+            if l != 0 && l < current {
+                can_advance = false;
                 break;
             }
         }
-        None
-    }
-
-    pub fn get(&self, key: &K) -> Option<V> {
-        let start = self.hash(key);
-        for probe in 0..N {
-            let idx = (start + probe) & (N - 1);
-            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(idx) };
-            let state = slot.state.load(Ordering::Acquire);
-            if state == EMPTY {
-                return None;
-            }
-            if state == OCCUPIED {
-                let existing = unsafe { *slot.key.get() };
-                if existing == *key {
-                    return Some(unsafe { *slot.value.get() });
-                }
-            }
+        if can_advance {
+            self.epoch_global.fetch_add(1, Ordering::AcqRel);
         }
-        None
     }
 
-    pub fn remove(&self, key: &K) -> Option<V> {
-        let start = self.hash(key);
-        for probe in 0..N {
-            let idx = (start + probe) & (N - 1);
-            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(idx) };
-            let state = slot.state.load(Ordering::Acquire);
-            if state == EMPTY {
-                return None;
-            }
-            if state == OCCUPIED {
-                let existing = unsafe { *slot.key.get() };
-                if existing == *key {
-                    if slot
-                        .state
-                        .compare_exchange(OCCUPIED, TOMBSTONE, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        return Some(unsafe { *slot.value.get() });
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    pub fn len_approx(&self) -> usize {
-        let mut c = 0;
-        for i in 0..N {
-            let slot = unsafe { &*(*self.slots.get()).as_ptr().add(i) };
-            if slot.state.load(Ordering::Relaxed) == OCCUPIED {
-                c += 1;
-            }
-        }
-        c
-    }
-}
-
-
-       
+    pub fn insert(&self
+    
            
+   
+                       
+   
+           
+              
+       
               
        
        
