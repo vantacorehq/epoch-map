@@ -1,7 +1,7 @@
 //! Lock-free concurrent hash map with epoch-based reclamation.
 //! Fixed capacity. Open addressing. Zero dependencies. no_std.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use core::cell::UnsafeCell;
 use core::hash::Hash;
