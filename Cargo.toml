@@ -1,0 +1,16 @@
+[package]
+name = "epoch-map"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Lock-free concurrent hash map with epoch-based reclamation. Fixed capacity. Zero dependencies. no_std."
+readme = "README.md"
+
+[dependencies]
+
+[dev-dependencies]
+dashmap = "6"
+
+[[example]]
+name = "p99"
+path = "examples/p99.rs"
