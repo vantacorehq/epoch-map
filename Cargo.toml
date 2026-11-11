@@ -1,15 +1,23 @@
 [package]
 name = "epoch-map"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "Lock-free concurrent hash map with epoch-based reclamation. Fixed capacity. Zero dependencies. no_std."
-readme = "README.md"
+description = "Fixed-capacity lock-free concurrent hash map with epoch-based reclamation"
 
-[dependencies]
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
 
 [dev-dependencies]
+criterion = "0.5"
 dashmap = "6"
+
+[[bench]]
+name = "concurrent"
+harness = false
 
 [[example]]
 name = "p99"
