@@ -1,3 +1,4 @@
+use std::vec;
 use super::{EpochMap, MapFull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
