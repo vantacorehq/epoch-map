@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="EPOCH-MAP">
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#18202b" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#f4f7fb"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="320" fill="#07090d"/>
+  <rect width="1200" height="320" fill="url(#grid)"/>
+  <rect width="8" height="320" fill="#7dd3fc"/>
+  <circle cx="1110" cy="64" r="46" fill="none" stroke="#7dd3fc" stroke-opacity="0.35" stroke-width="2"/>
+  <circle cx="1110" cy="64" r="8" fill="#7dd3fc"/>
+  <text x="48" y="78" fill="#7dd3fc" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14" letter-spacing="3">OPEN ADDRESSING  ·  EPOCH RECLAMATION  ·  MACHINE WORDS</text>
+  <text x="46" y="168" fill="url(#title)" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="64" font-weight="700">EPOCH-MAP</text>
+  <text x="48" y="224" fill="#93a0b0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="20">Fixed-capacity concurrent map. Atomics, no locks, no_std.</text>
+</svg>
