@@ -1,1 +1,22 @@
-PLACEHOLDER
+[package]
+name = "epoch-map"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "Fixed-capacity concurrent hash map with quiescent-epoch reclamation (no_std + alloc). High-performance lock-free map."
+readme = "README.md"
+keywords = ["hashmap", "concurrent", "lock-free", "no_std", "epoch", "cache"]
+categories = ["data-structures", "concurrency", "no-std"]
+repository = "https://github.com/vantacorehq/epoch-map"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+debug = false
+lto = true
+codegen-units = 1
