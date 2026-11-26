@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Fixed-capacity concurrent hash map with quiescent-epoch reclamation (no_std + alloc). High-performance lock-free map."
 readme = "README.md"
-keywords = ["hashmap", "concurrent", "lock-free", "no_std", "epoch", "cache"]
+keywords = ["hashmap", "concurrent", "lock-free", "no_std", "epoch"]
 categories = ["data-structures", "concurrency", "no-std"]
 repository = "https://github.com/vantacorehq/epoch-map"
 
@@ -15,8 +15,8 @@ path = "src/lib.rs"
 [features]
 default = ["std"]
 std = []
-# Enable loom model checking (dev only, does not affect production no_std code)
-loom = ["dep:loom"]
+# Enable loom model checking tests (cargo test --features loom)
+loom = []
 
 [profile.release]
 debug = false
@@ -24,8 +24,7 @@ lto = true
 codegen-units = 1
 
 [dev-dependencies]
-# Formal concurrency testing
-loom = { version = "0.7", optional = true }
+loom = "0.7"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 
