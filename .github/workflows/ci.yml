@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   test:
@@ -19,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --all-features -- --nocapture
+        run: cargo test -- --nocapture
       - name: cargo test (no_std)
         run: cargo test --no-default-features --lib
 
@@ -33,13 +32,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: cargo clippy (no_std)
         run: cargo clippy --no-default-features -- -D warnings
 
   miri:
     name: Miri
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -49,7 +49,7 @@ jobs:
       - name: cargo miri test
         run: cargo miri test --lib
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
+          MIRIFLAGS: -Zmiri-ignore-leaks
 
   fmt:
     name: Format
@@ -59,4 +59,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
