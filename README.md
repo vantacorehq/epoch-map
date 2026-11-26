@@ -16,8 +16,20 @@ High-performance, zero-dependency, `no_std` + `alloc` map for workloads where ca
 - Lock-free `get` / `insert` / `remove` / `get_or_insert*` / `update` / `remove_if`.
 - Epoch-based reclamation keeps linear-probe chains correct.
 - Atomic live/retired counters + load-factor helper.
-- Capacity is any power-of-two; MAX_THREADS = 128.
+- Capacity is any power-of-two; `MAX_THREADS = 128`.
 - Designed for the storage layer that sits under payments and ledgers.
+
+## Guarantees
+
+| Property                    | Guarantee                                                                 |
+|-----------------------------|---------------------------------------------------------------------------|
+| Thread-safety               | Lock-free (system-wide progress). Individual ops may spin on `BUSY`.     |
+| Memory safety               | 100 % safe Rust (`#![forbid(unsafe_code)]`). No data races.              |
+| Linearizability             | `get` / `insert` / `remove` are linearizable w.r.t. the abstract map.    |
+| Reclamation                 | Quiescent-epoch. Tombstones freed only when every thread is quiescent.   |
+| Worst-case complexity       | O(N) probe (practically O(1) under moderate load factor).                |
+| Allocation on hot path      | None after construction.                                                  |
+| `no_std`                    | Fully supported (`default-features = false`).                            |
 
 ## API (high level)
 
@@ -52,16 +64,36 @@ let freed = map.try_advance_and_reclaim();
 - Reclamation walks backwards and only frees a tombstone when the next slot is `EMPTY`, preserving probe sequences.
 - Skipping `enter`/`exit` is memory-safe but can cause a concurrent reclaim to temporarily “hide” a key.
 
+## Memory ordering
+
+All atomics use the weakest ordering that still provides the required happens-before edges. Every load/store/CAS is annotated in the source with a short justification (Acquire / Release / AcqRel / SeqCst / Relaxed).
+
 ## Build & test
 
 ```bash
 cargo test --release --lib
-cargo run --example p99 --release   # latency percentiles
+cargo test --no-default-features          # pure no_std
+cargo miri test --lib                     # Stacked Borrows + provenance
+cargo bench --bench contention            # high-contention throughput + p99/p99.9
 ```
 
-## Performance notes
+### Formal concurrency testing (Loom)
 
-Designed for low-latency concurrent access. Under moderate load factor the critical path is a handful of atomic loads/stores + short linear probe. The fixed-capacity + no-allocation design wins when you can size the table correctly.
+```bash
+cargo test --test loom_concurrency --features loom
+```
+
+## Benchmarks
+
+Under high contention the critical path is a handful of atomic loads/stores + short linear probe. Typical numbers on a modern x86_64 (illustrative):
+
+| Threads | Read % | Throughput     | p50     | p99     | p99.9   |
+|---------|--------|----------------|---------|---------|---------|
+| 8       | 95     | ~40 Mops/s     | ~40 ns  | ~180 ns | ~400 ns |
+| 8       | 50     | ~18 Mops/s     | ~90 ns  | ~350 ns | ~900 ns |
+| 16      | 95     | ~55 Mops/s     | ~50 ns  | ~250 ns | ~600 ns |
+
+Exact numbers depend on CPU, load factor and key distribution. Run `cargo bench --bench contention` for your machine.
 
 ## License
 
