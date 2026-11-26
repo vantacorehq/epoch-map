@@ -44,6 +44,11 @@
 //!   thread is quiescent (no active `enter`). This preserves linear probing chains.
 //! - All operations are lock-free (progress of the system is guaranteed; individual
 //!   operations may spin briefly on BUSY).
+//!
+//! ## Memory ordering
+//!
+//! All atomics use the weakest ordering that still provides the required happens-before
+//! edges. See inline comments on every atomic operation for the justification.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -159,30 +164,65 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
     #[inline]
     fn start(key: u64) -> usize { (mix(key) as usize) & (N - 1) }
 
+    /// Publish that this thread is active in the current epoch.
+    ///
+    /// Must be paired with [`exit`]. Distinct `tid`s are required.
     pub fn enter(&self, tid: usize) {
         debug_assert!(tid < MAX_THREADS);
         loop {
-            while self.reclaiming.load(Ordering::SeqCst) { core::hint::spin_loop(); }
+            // SeqCst on reclaiming: full barrier so we never enter while a
+            // reclaimer is between the quiescence check and the state stores.
+            while self.reclaiming.load(Ordering::SeqCst) {
+                core::hint::spin_loop();
+            }
+            // SeqCst load of global epoch + SeqCst store of local epoch:
+            // establishes a total order with the reclaimer’s observation of
+            // all local epochs.
             let g = self.epoch_global.load(Ordering::SeqCst);
             self.epoch_locals[tid].store(g, Ordering::SeqCst);
-            if !self.reclaiming.load(Ordering::SeqCst) { return; }
+            if !self.reclaiming.load(Ordering::SeqCst) {
+                return;
+            }
+            // Lost the race with a reclaimer; clear and retry.
             self.epoch_locals[tid].store(0, Ordering::SeqCst);
         }
     }
 
+    /// Mark this thread quiescent.
     pub fn exit(&self, tid: usize) {
         debug_assert!(tid < MAX_THREADS);
+        // SeqCst: the store must be visible to any subsequent reclaimer
+        // that loads all local epochs under SeqCst.
         self.epoch_locals[tid].store(0, Ordering::SeqCst);
     }
 
-    pub fn epoch(&self) -> u64 { self.epoch_global.load(Ordering::Acquire) }
+    pub fn epoch(&self) -> u64 {
+        // Acquire is enough for a plain observation; no release side needed.
+        self.epoch_global.load(Ordering::Acquire)
+    }
 
+    /// Advance the global epoch and reclaim tombstones that are no longer
+    /// reachable by any probe sequence, but only when every thread is
+    /// quiescent. Returns the number of slots freed.
     pub fn try_advance_and_reclaim(&self) -> usize {
-        if self.reclaiming.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        // AcqRel on the reclaiming flag: exclusive ownership of the reclaim
+        // critical section and synchronizes with the SeqCst loads in enter().
+        if self
+            .reclaiming
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return 0;
         }
-        if self.epoch_locals.iter().any(|l| l.load(Ordering::SeqCst) != 0) {
-            self.reclaiming.store(false, Ordering::SeqCst);
+
+        // SeqCst loads of every local epoch: must observe the most recent
+        // enter/exit of every thread.
+        if self
+            .epoch_locals
+            .iter()
+            .any(|l| l.load(Ordering::SeqCst) != 0)
+        {
+            self.reclaiming.store(false, Ordering::Release);
             return 0;
         }
 
@@ -191,20 +231,32 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
             let mut changed = false;
             for i in (0..N).rev() {
                 let slot = &self.slots[i];
+                // Acquire on state: see the Release that published TOMBSTONE
+                // (or EMPTY) from a concurrent remove / previous reclaim.
                 if slot.state.load(Ordering::Acquire) == TOMBSTONE
-                    && self.slots[(i + 1) & (N - 1)].state.load(Ordering::Acquire) == EMPTY
+                    && self.slots[(i + 1) & (N - 1)]
+                        .state
+                        .load(Ordering::Acquire)
+                        == EMPTY
                 {
+                    // Release: subsequent probes must observe EMPTY.
                     slot.state.store(EMPTY, Ordering::Release);
                     freed += 1;
                     changed = true;
                 }
             }
-            if !changed { break; }
+            if !changed {
+                break;
+            }
         }
 
-        if freed > 0 { self.retired_count.fetch_sub(freed, Ordering::Relaxed); }
+        if freed > 0 {
+            // Relaxed: pure counter, no synchronisation required.
+            self.retired_count.fetch_sub(freed, Ordering::Relaxed);
+        }
+        // AcqRel: publish the new epoch so future enter() calls observe it.
         self.epoch_global.fetch_add(1, Ordering::AcqRel);
-        self.reclaiming.store(false, Ordering::SeqCst);
+        self.reclaiming.store(false, Ordering::Release);
         freed
     }
 
@@ -221,11 +273,23 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
             let idx = (start + probe) & (N - 1);
             let slot = &self.slots[idx];
             loop {
+                // Acquire: observe the most recent state transition.
                 match slot.state.load(Ordering::Acquire) {
                     EMPTY => {
-                        if slot.state.compare_exchange(EMPTY, BUSY, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                        // Acquire success / Relaxed failure: on success we
+                        // become the sole owner of the slot; the subsequent
+                        // Release store of OCCUPIED publishes key+value.
+                        if slot
+                            .state
+                            .compare_exchange(EMPTY, BUSY, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            // Relaxed: the later Release on state is the
+                            // publication barrier for key and value.
                             slot.key.store(kw, Ordering::Relaxed);
                             slot.value.store(vw, Ordering::Relaxed);
+                            // Release: synchronizes-with any Acquire load
+                            // that sees OCCUPIED.
                             slot.state.store(OCCUPIED, Ordering::Release);
                             self.live_count.fetch_add(1, Ordering::Relaxed);
                             return Ok(None);
@@ -233,15 +297,29 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
                     }
                     BUSY => core::hint::spin_loop(),
                     OCCUPIED => {
+                        // Relaxed: key is immutable after the initial
+                        // Release that published OCCUPIED.
                         if slot.key.load(Ordering::Relaxed) == kw {
+                            // AcqRel: obtain the previous value and publish
+                            // the new one under the same slot ownership.
                             let old = slot.value.swap(vw, Ordering::AcqRel);
                             return Ok(Some(V::from_word(old)));
                         }
                         break;
                     }
                     _ => {
+                        // TOMBSTONE (or any other non-EMPTY/BUSY/OCCUPIED)
                         if slot.key.load(Ordering::Relaxed) == kw {
-                            if slot.state.compare_exchange(TOMBSTONE, BUSY, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                            if slot
+                                .state
+                                .compare_exchange(
+                                    TOMBSTONE,
+                                    BUSY,
+                                    Ordering::Acquire,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
                                 slot.value.store(vw, Ordering::Relaxed);
                                 slot.state.store(OCCUPIED, Ordering::Release);
                                 self.retired_count.fetch_sub(1, Ordering::Relaxed);
@@ -270,12 +348,16 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
                     BUSY => core::hint::spin_loop(),
                     OCCUPIED => {
                         if slot.key.load(Ordering::Relaxed) == kw {
+                            // Acquire on value: synchronize with the
+                            // Release/AcqRel that wrote it.
                             return Some(V::from_word(slot.value.load(Ordering::Acquire)));
                         }
                         break;
                     }
                     _ => {
-                        if slot.key.load(Ordering::Relaxed) == kw { return None; }
+                        if slot.key.load(Ordering::Relaxed) == kw {
+                            return None;
+                        }
                         break;
                     }
                 }
@@ -285,10 +367,14 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
     }
 
     #[inline]
-    pub fn contains_key(&self, key: &K) -> bool { self.get(key).is_some() }
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
 
     pub fn get_or_insert(&self, key: K, value: V) -> V {
-        if let Some(v) = self.get(&key) { return v; }
+        if let Some(v) = self.get(&key) {
+            return v;
+        }
         match self.try_insert(key, value) {
             Ok(None) => value,
             Ok(Some(old)) => old,
@@ -297,9 +383,12 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
     }
 
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
-    where F: FnOnce() -> V,
+    where
+        F: FnOnce() -> V,
     {
-        if let Some(v) = self.get(&key) { return v; }
+        if let Some(v) = self.get(&key) {
+            return v;
+        }
         let value = f();
         match self.try_insert(key, value) {
             Ok(None) => value,
@@ -309,7 +398,8 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
     }
 
     pub fn update<F>(&self, key: &K, f: F) -> Option<V>
-    where F: FnOnce(V) -> V,
+    where
+        F: FnOnce(V) -> V,
     {
         let kw = key.to_word();
         let start = Self::start(kw);
@@ -321,14 +411,19 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
                     EMPTY => return None,
                     BUSY => core::hint::spin_loop(),
                     OCCUPIED => {
-                        if slot.key.load(Ordering::Relaxed) != kw { break; }
+                        if slot.key.load(Ordering::Relaxed) != kw {
+                            break;
+                        }
                         let old = V::from_word(slot.value.load(Ordering::Acquire));
                         let new = f(old);
+                        // Release: publish the new value.
                         slot.value.store(new.to_word(), Ordering::Release);
                         return Some(new);
                     }
                     _ => {
-                        if slot.key.load(Ordering::Relaxed) == kw { return None; }
+                        if slot.key.load(Ordering::Relaxed) == kw {
+                            return None;
+                        }
                         break;
                     }
                 }
@@ -348,16 +443,32 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
                     EMPTY => return None,
                     BUSY => core::hint::spin_loop(),
                     OCCUPIED => {
-                        if slot.key.load(Ordering::Relaxed) != kw { break; }
+                        if slot.key.load(Ordering::Relaxed) != kw {
+                            break;
+                        }
                         let v = slot.value.load(Ordering::Acquire);
-                        if slot.state.compare_exchange(OCCUPIED, TOMBSTONE, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        // AcqRel: claim ownership of the transition and
+                        // publish TOMBSTONE so reclaimers and later probes
+                        // observe it.
+                        if slot
+                            .state
+                            .compare_exchange(
+                                OCCUPIED,
+                                TOMBSTONE,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
                             self.retired_count.fetch_add(1, Ordering::Relaxed);
                             self.live_count.fetch_sub(1, Ordering::Relaxed);
                             return Some(V::from_word(v));
                         }
                     }
                     _ => {
-                        if slot.key.load(Ordering::Relaxed) == kw { return None; }
+                        if slot.key.load(Ordering::Relaxed) == kw {
+                            return None;
+                        }
                         break;
                     }
                 }
@@ -367,25 +478,39 @@ impl<K: Word, V: Word, const N: usize> EpochMap<K, V, N> {
     }
 
     pub fn remove_if<F>(&self, key: &K, pred: F) -> Option<V>
-    where F: FnOnce(&V) -> bool,
+    where
+        F: FnOnce(&V) -> bool,
     {
         if let Some(v) = self.get(key) {
-            if pred(&v) { return self.remove(key); }
+            if pred(&v) {
+                return self.remove(key);
+            }
         }
         None
     }
 
-    pub fn len(&self) -> usize { self.live_count.load(Ordering::Relaxed) }
-
-    pub fn len_approx(&self) -> usize {
-        self.slots.iter().filter(|s| s.state.load(Ordering::Relaxed) == OCCUPIED).count()
+    pub fn len(&self) -> usize {
+        self.live_count.load(Ordering::Relaxed)
     }
 
-    pub fn retired(&self) -> usize { self.retired_count.load(Ordering::Relaxed) }
+    pub fn len_approx(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| s.state.load(Ordering::Relaxed) == OCCUPIED)
+            .count()
+    }
 
-    pub fn retired_approx(&self) -> usize { self.retired() }
+    pub fn retired(&self) -> usize {
+        self.retired_count.load(Ordering::Relaxed)
+    }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn retired_approx(&self) -> usize {
+        self.retired()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     pub fn load_factor(&self) -> f64 {
         let used = self.len() + self.retired();
